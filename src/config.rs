@@ -1,8 +1,11 @@
 //! Configuration management.
 //!
 //! Adopts Ludusavi's native `config.yaml` schema (`src/resource/config.rs`)
-//! so this app and Ludusavi share one settings file:
-//! `%APPDATA%/ludusavi/config.yaml` on Windows.
+//! so this app's file stays fully interchangeable with Ludusavi's own.
+//! The file itself is portable: `config.yaml` is read from — and written
+//! to — the directory containing the executable, not `%APPDATA%`.
+//! On first run it is seeded from Ludusavi's shared config when one
+//! exists, so settings carry over unchanged.
 //!
 //! Only the sections this app uses are typed (`backup.path`,
 //! `backup.retention`, `restore.path`, `roots`). Every other field is
@@ -245,9 +248,20 @@ impl Default for Retention {
 }
 
 impl Config {
-    /// `config.yaml` inside the shared Ludusavi app-data dir
-    /// (`CommonPath::Config` + `ludusavi`, matching Ludusavi's `app_dir()`).
+    /// Portable `config.yaml` in the directory containing the
+    /// executable — the app is fully self-contained, nothing lands in
+    /// AppData. Falls back to the working directory if the exe path
+    /// can't be resolved.
     pub fn file_path() -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("config.yaml")))
+            .unwrap_or_else(|| PathBuf::from("config.yaml"))
+    }
+
+    /// Ludusavi's shared config — `%APPDATA%/ludusavi/config.yaml` —
+    /// kept only as a one-time migration source.
+    fn shared_ludusavi_path() -> PathBuf {
         let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("ludusavi").join("config.yaml")
     }
@@ -257,11 +271,21 @@ impl Config {
         format!("{}/ludusavi-backup", CommonPath::Home.get().unwrap_or("C:/Users/Public"))
     }
 
-    /// Load the shared config, falling back to defaults when the file
+    /// Load the portable config, falling back to defaults when the file
     /// is missing or unreadable, then normalizing like Ludusavi's
     /// `migrate`/`initialize` (empty paths get defaults, `full` >= 1).
+    /// First run in portable mode: if no `config.yaml` sits next to the
+    /// exe yet, seed it from Ludusavi's shared AppData config so every
+    /// setting — backup dirs, roots, cloud, verifiedSaves, theme —
+    /// carries over byte-for-byte.
     pub fn load() -> Self {
         let path = Self::file_path();
+        if !path.exists() {
+            let shared = Self::shared_ludusavi_path();
+            if shared.exists() && shared != path {
+                let _ = std::fs::copy(&shared, &path);
+            }
+        }
         let mut config = std::fs::read_to_string(&path)
             .ok()
             .and_then(|content| serde_yaml::from_str::<Config>(&content).ok())

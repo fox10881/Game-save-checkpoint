@@ -158,10 +158,9 @@ fn ludusavi_config_roots() -> Vec<Root> {
         path: String,
     }
 
-    let Some(config_dir) = dirs::config_dir() else {
-        return vec![];
-    };
-    let config_file = config_dir.join("ludusavi").join("config.yaml");
+    // `roots:` come from the app's own (portable) config.yaml — same
+    // schema as Ludusavi's, seeded from it on first run.
+    let config_file = crate::config::Config::file_path();
     let Ok(content) = std::fs::read_to_string(&config_file) else {
         return vec![];
     };
