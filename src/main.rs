@@ -173,10 +173,13 @@ impl GameRow {
     /// confirmed its save locations, so the "config only" heuristic is
     /// bypassed and the row shows its normal backup-status color.
     fn status(&self, verified: bool) -> Status {
-        if !self.installed {
-            Status::NotInstalled
-        } else if !verified && self.scan.as_ref().is_some_and(|s| s.found_files.is_empty()) {
+        // The "config only" warning outranks not-installed: a game that
+        // only ever held config files is worth flagging even when it
+        // isn't installed here.
+        if !verified && self.is_config_only() {
             Status::ConfigOnly
+        } else if !self.installed {
+            Status::NotInstalled
         } else {
             match self.latest_backup {
                 None => Status::NoBackup,
@@ -190,6 +193,39 @@ impl GameRow {
             }
         }
     }
+
+    /// The "config only / missing save data" heuristic:
+    /// - installed + scanned + zero files → nothing to back up;
+    /// - local scan found files but EVERY one is a config-type file
+    ///   (ini/cfg/json/xml/…) → config, not save data;
+    /// - not installed → judged by backup contents instead: a snapshot
+    ///   holding only config files warns the same way.
+    fn is_config_only(&self) -> bool {
+        if let Some(scan) = &self.scan
+            && !scan.found_files.is_empty()
+        {
+            return scan.found_files.keys().all(|p| is_config_file(p));
+        }
+        if self.installed {
+            return self.scan.is_some();
+        }
+        !self.backup_files.is_empty()
+            && self.backup_files.iter().all(|(p, _)| is_config_file(p))
+    }
+}
+
+/// Whether `path` looks like a config file rather than save data —
+/// used by the "config only" heuristic. No-extension files count as
+/// save data (binary blobs), so only a known config extension flags.
+fn is_config_file(path: &str) -> bool {
+    const CONFIG_EXTS: &[&str] = &[
+        "ini", "cfg", "conf", "config", "json", "xml", "yaml", "yml", "toml",
+        "properties", "prefs", "opt", "settings",
+    ];
+    let ext = path
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase());
+    ext.is_some_and(|e| CONFIG_EXTS.contains(&e.as_str()))
 }
 
 /// Messages sent from worker threads back to the UI.
@@ -3098,21 +3134,28 @@ fn browse_folder(initial: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A minimal row: installed (or not), an empty-or-populated scan,
-    /// and an optional backup timestamp.
-    fn row(installed: bool, files: usize, latest_backup: Option<chrono::DateTime<chrono::Utc>>) -> GameRow {
-        let mut found_files = BTreeMap::new();
-        for i in 0..files {
-            found_files.insert(
-                format!("C:/saves/save{i}.sav"),
-                scanner::ScannedFile {
-                    size: 4,
-                    hash: String::new(),
-                    change: ScanChange::Unknown,
-                    mtime: None,
-                },
-            );
-        }
+    /// A minimal row with explicit local-scan and backup file paths, so
+    /// tests can exercise the file-type-aware "config only" heuristic.
+    fn row(
+        installed: bool,
+        scan_paths: &[&str],
+        backup_paths: &[&str],
+        latest_backup: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> GameRow {
+        let found_files = scan_paths
+            .iter()
+            .map(|p| {
+                (
+                    p.to_string(),
+                    scanner::ScannedFile {
+                        size: 4,
+                        hash: String::new(),
+                        change: ScanChange::Unknown,
+                        mtime: None,
+                    },
+                )
+            })
+            .collect();
         GameRow {
             name: "T".to_string(),
             path_hint: String::new(),
@@ -3125,32 +3168,45 @@ mod tests {
             }),
             latest_backup,
             restorable_at: None,
-            backup_files: vec![],
+            backup_files: backup_paths.iter().map(|p| (p.to_string(), 4u64)).collect(),
         }
     }
 
-    /// "Config only" heuristic: installed but zero save files found
-    /// warns orange — unless the user verified the saves, in which case
-    /// the row shows its normal backup status.
+    /// "Config only" heuristic: only config-type files — or no files at
+    /// all — warns orange even ahead of not-installed, unless the user
+    /// verified the saves.
     #[test]
     fn config_only_status_and_verified_bypass() {
         let now = chrono::Utc::now();
         // Installed + empty scan + no backup -> orange warning.
-        let g = row(true, 0, None);
+        let g = row(true, &[], &[], None);
         assert!(matches!(g.status(false), Status::ConfigOnly));
         // Verified -> bypasses to the normal "no backup" red.
         assert!(matches!(g.status(true), Status::NoBackup));
         // The warning still wins over a recent backup (saves are
         // missing NOW); verified reveals the underlying green.
-        let g = row(true, 0, Some(now));
+        let g = row(true, &[], &[], Some(now));
         assert!(matches!(g.status(false), Status::ConfigOnly));
         assert!(matches!(g.status(true), Status::RecentBackup));
-        // Not-installed rows are never config-only — purple wins.
-        let g = row(false, 0, None);
-        assert!(matches!(g.status(false), Status::NotInstalled));
+        // Installed with only config files found -> orange.
+        let g = row(true, &["C:/g/config.ini", "C:/g/settings.json"], &[], None);
+        assert!(matches!(g.status(false), Status::ConfigOnly));
+        // Config files alongside real save data -> normal status.
+        let g = row(true, &["C:/g/config.ini", "C:/g/save.sav"], &[], None);
+        assert!(matches!(g.status(false), Status::NoBackup));
+        // Not installed but the backup holds only config files ->
+        // orange outranks purple.
+        let g = row(false, &[], &["config.ini", "prefs.cfg"], None);
+        assert!(matches!(g.status(false), Status::ConfigOnly));
+        // Verified not-installed + config-only backup -> purple.
         assert!(matches!(g.status(true), Status::NotInstalled));
+        // Not installed with real save data in the backup -> purple.
+        let g = row(false, &[], &["config.ini", "progress.sav"], None);
+        assert!(matches!(g.status(false), Status::NotInstalled));
+        let g = row(false, &[], &["progress.sav"], None);
+        assert!(matches!(g.status(false), Status::NotInstalled));
         // Games that actually have save files are unaffected.
-        let g = row(true, 3, None);
+        let g = row(true, &["C:/saves/a.sav", "C:/saves/b.dat"], &[], None);
         assert!(matches!(g.status(false), Status::NoBackup));
     }
 

@@ -34,10 +34,13 @@ seamlessly.
   tombstone semantics.
 - **Retention limits** — configurable Full and Differential retention,
   pruning older snapshots per Ludusavi's rules.
-- **Smart "Config Only" warnings** — games detected as installed but with
-  no save data found are flagged in orange. A one-click **Verify Saves**
-  marks the game as confirmed (persisted to config) and restores its normal
-  status color. Per-status bulk selection + live counters in the header.
+- **Smart "Config Only" warnings** — games whose local scan finds no
+  save data, or whose scan/backup contents are only config-type files
+  (`.ini`, `.cfg`, `.json`, `.xml`, …), are flagged in orange — the
+  warning outranks "not installed", so a config-only backup is still
+  flagged. A one-click **Verify Saves** marks the game as confirmed
+  (persisted to config) and restores its normal status color.
+  Per-status bulk selection + live counters in the header.
 - **Light / Dark themes** — shared `theme:` key with Ludusavi, switchable
   in Settings; the whole palette follows.
 - **Full Arabic (RTL) support** — complete English/Arabic localization via
@@ -148,9 +151,12 @@ Ludusavi محلياً بالكامل (دون تشغيله كعملية خارج�
   فتستعيد النقطة الزمنية المطلوبة بدقة.
 - **حدود الاحتفاظ** — تحديد عدد النسخ الكاملة والتفاضلية المحفوظة
   مع حذف الأقدم وفق قواعد Ludusavi.
-- **تحذيرات "إعدادات فقط" الذكية** — الألعاب المثبتة التي لم يُعثر على
-  بيانات حفظ لها تظهر باللون البرتقالي، وزر «تأكيد صحة الملفات» يسجلها
-  يدوياً فيعيد لونها الطبيعي، مع عدادات وأزرار تحديد جماعية حسب الحالة.
+- **تحذيرات "إعدادات فقط" الذكية** — الألعاب التي لا يجد فحصها أي
+  بيانات حفظ، أو التي لا تحتوي ملفاتها المفحوصة أو نسختها الاحتياطية
+  إلا على ملفات إعدادات (مثل ini وcfg وjson وxml)، تظهر باللون
+  البرتقالي ويتقدّم التحذير على حالة «غير مثبت»، وزر «تأكيد صحة
+  الملفات» يسجلها يدوياً فيعيد لونها الطبيعي، مع عدادات وأزرار
+  تحديد جماعية حسب الحالة.
 - **سمات فاتحة وداكنة** — مفتاح `theme:` مشترك مع Ludusavi قابل
   للتبديل من الإعدادات، وتتبعه لوحة الألوان كاملة.
 - **دعم عربي كامل (RTL)** — ترجمة كاملة عبر `locales.yaml` قابل
