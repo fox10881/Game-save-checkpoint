@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::Os;
 use crate::paths::{normalize, split_drive};
-use crate::scanner::{ScanChange, ScanInfo};
+use crate::scanner::{ScanChange, ScanInfo, ScannedFile};
 
 /// From Ludusavi's `prelude.rs`.
 pub const INVALID_FILE_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|', '\0'];
@@ -480,6 +480,57 @@ impl BackupLayout {
         }
         report
     }
+
+    /// Whether the local scan is content-identical to ANY recorded
+    /// snapshot: every file in some effective restore plan exists
+    /// locally with the same hash+size, and the scan holds no extra
+    /// files. `std::fs::copy` preserves the source mtime, so a
+    /// just-restored file keeps the backup-era date — timestamps alone
+    /// can't tell "old data" from "in sync", but hashes can. Checking
+    /// every snapshot (not just the newest) means a deliberate older
+    /// restore still counts as synchronized.
+    pub fn is_synced(&self, game_name: &str, found: &BTreeMap<String, ScannedFile>) -> bool {
+        let Some(mapping) = self.load_mapping(game_name) else {
+            return false;
+        };
+        if found.is_empty() {
+            return false;
+        }
+        let matches = |effective: &BTreeMap<String, (IndividualMappingFile, String)>| {
+            effective.len() == found.len()
+                && effective.iter().all(|(path, (info, _))| {
+                    found
+                        .get(path)
+                        .is_some_and(|f| f.hash == info.hash && f.size == info.size)
+                })
+        };
+        for full in &mapping.backups {
+            let mut effective: BTreeMap<String, (IndividualMappingFile, String)> = full
+                .files
+                .iter()
+                .map(|(k, v)| (k.clone(), (v.clone(), full.name.clone())))
+                .collect();
+            if matches(&effective) {
+                return true;
+            }
+            for child in &full.children {
+                for (k, v) in &child.files {
+                    match v {
+                        Some(f) => {
+                            effective.insert(k.clone(), (f.clone(), child.name.clone()));
+                        }
+                        None => {
+                            effective.remove(k);
+                        }
+                    }
+                }
+                if matches(&effective) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -672,6 +723,72 @@ backups:
         let r = layout.restore_game_version("VerGame", Some("backup-999"));
         assert!(r.backup_name.is_none());
         assert_eq!(r.skipped_reason.as_deref(), Some("backup \"backup-999\" not found"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `is_synced` compares the local scan against every snapshot's
+    /// effective plan — hashes, not mtimes. Restored files keep their
+    /// original timestamps, so a correct restore still shows an old
+    /// "local save" date; this is the check that catches that.
+    #[test]
+    fn is_synced_compares_hashes_against_newest_snapshot() {
+        let base = std::env::temp_dir().join("gsc-tests").join("synced");
+        let _ = std::fs::remove_dir_all(&base);
+        let game_dir = base.join("SyncGame");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        std::fs::write(
+            game_dir.join("mapping.yaml"),
+            r#"---
+name: SyncGame
+drives: {}
+backups:
+  - name: backup-20240101T000000Z
+    when: 2024-01-01T00:00:00Z
+    files:
+      "C:/Saves/a.sav": { hash: h1, size: 100 }
+      "C:/Saves/b.sav": { hash: h2, size: 200 }
+    children:
+      - name: backup-20240102T000000Z
+        when: 2024-01-02T00:00:00Z
+        files:
+          "C:/Saves/a.sav": { hash: h3, size: 150 }
+          "C:/Saves/b.sav": ~
+"#,
+        )
+        .unwrap();
+        let layout = BackupLayout::new(base.clone());
+        let file = |hash: &str, size: u64| ScannedFile {
+            size,
+            hash: hash.to_string(),
+            change: ScanChange::Same,
+            mtime: None,
+        };
+        let scan = |files: &[(&str, &str, u64)]| {
+            files
+                .iter()
+                .map(|(p, h, s)| (p.to_string(), file(h, *s)))
+                .collect::<BTreeMap<_, _>>()
+        };
+
+        // Newest = the differential: a@h3 only (b tombstoned).
+        assert!(layout.is_synced("SyncGame", &scan(&[("C:/Saves/a.sav", "h3", 150)])));
+        // The tombstoned file still being there → not synced.
+        assert!(!layout.is_synced(
+            "SyncGame",
+            &scan(&[("C:/Saves/a.sav", "h3", 150), ("C:/Saves/b.sav", "h2", 200)])
+        ));
+        // The full backup's state IS a recorded snapshot — restoring an
+        // older version still counts as synchronized.
+        assert!(layout.is_synced(
+            "SyncGame",
+            &scan(&[("C:/Saves/a.sav", "h1", 100), ("C:/Saves/b.sav", "h2", 200)])
+        ));
+        // Changed hash, missing file, extra file, empty scan → false.
+        assert!(!layout.is_synced("SyncGame", &scan(&[("C:/Saves/a.sav", "hx", 150)])));
+        assert!(!layout.is_synced("SyncGame", &scan(&[])));
+        // No backup at all → false.
+        assert!(!layout.is_synced("NoGame", &scan(&[("C:/a", "h", 1)])));
 
         let _ = std::fs::remove_dir_all(&base);
     }

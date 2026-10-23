@@ -254,13 +254,14 @@ pub fn trf(key: &str, args: &[(&str, &dyn Display)]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
     /// `LOCALES` is a process-wide global — serialize tests so language
-    /// switches can't race.
-    static LOCK: Mutex<()> = Mutex::new(());
+    /// switches can't race. `pub(crate)` so main.rs tests that read
+    /// `tr()` output take the same lock.
+    pub(crate) static LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn dump_shaping() {

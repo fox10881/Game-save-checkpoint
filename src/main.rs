@@ -166,6 +166,11 @@ struct GameRow {
     /// Files in the newest backup snapshot: (original path, size).
     /// Used to display meaningful data for not-installed games.
     backup_files: Vec<(String, u64)>,
+    /// Local files hash-match the restorable snapshot — true right
+    /// after a backup/restore. Copying preserves file mtimes, so the
+    /// raw "local save" date lies about staleness; this flag is how
+    /// the UI knows the dates differ but the content doesn't.
+    synced: bool,
 }
 
 impl GameRow {
@@ -184,7 +189,13 @@ impl GameRow {
             match self.latest_backup {
                 None => Status::NoBackup,
                 Some(when) => {
-                    if chrono::Utc::now() - when <= chrono::Duration::days(RECENT_BACKUP_DAYS) {
+                    // Green requires the backup to be both RECENT and
+                    // CURRENT — a backup that predates changed local
+                    // files is yellow regardless of its age.
+                    if self.needs_backup(when) {
+                        Status::OldBackup
+                    } else if chrono::Utc::now() - when <= chrono::Duration::days(RECENT_BACKUP_DAYS)
+                    {
                         Status::RecentBackup
                     } else {
                         Status::OldBackup
@@ -192,6 +203,28 @@ impl GameRow {
                 }
             }
         }
+    }
+
+    /// Strict staleness check: a backup exists, but do the local files
+    /// still match it? Yellow when EITHER
+    /// - any file's mtime is strictly newer than the backup timestamp
+    ///   (the timestamp rule — something was written after the backup), or
+    /// - any file's content differs from the newest snapshot's record
+    ///   (`ScanChange::New`/`Different` — hash mismatch or untracked).
+    /// The `synced` flag short-circuits both: hash-verified identical
+    /// content is never stale, however misleading preserved mtimes look.
+    fn needs_backup(&self, backup_when: chrono::DateTime<chrono::Utc>) -> bool {
+        let Some(scan) = &self.scan else {
+            return false;
+        };
+        if scan.found_files.is_empty() || self.synced {
+            return false;
+        }
+        scan.found_files.values().any(|f| {
+            !matches!(f.change, ScanChange::Same)
+                || f.mtime
+                    .is_some_and(|t| chrono::DateTime::<chrono::Utc>::from(t) > backup_when)
+        })
     }
 
     /// The "config only / missing save data" heuristic:
@@ -240,6 +273,7 @@ enum Msg {
         latest_backup: Option<chrono::DateTime<chrono::Utc>>,
         restorable_at: Option<chrono::DateTime<chrono::Utc>>,
         backup_files: Vec<(String, u64)>,
+        synced: bool,
     },
     ScanFinished {
         games: usize,
@@ -290,6 +324,13 @@ struct CheckpointApp {
     /// Selected backup version (`backup-<ts>` folder name) per game in
     /// the restore modal; defaults to each game's newest snapshot.
     restore_choice: HashMap<String, String>,
+    /// Per-game results from the finished restore run, shown in the
+    /// "Restore Report" modal.
+    restore_results: Vec<backup::RestoreReport>,
+    show_restore_report: bool,
+    /// Games that get a targeted rescan once the restore report is
+    /// dismissed — refreshes local mtimes/status without a full scan.
+    restore_rescan: Vec<String>,
     /// Game awaiting local-save deletion while the modal is open.
     pending_delete: Option<String>,
     /// Game being edited in the "Set Custom Path" modal + the draft path.
@@ -398,6 +439,9 @@ impl CheckpointApp {
             show_backup_summary: false,
             pending_restore: vec![],
             restore_choice: HashMap::new(),
+            restore_results: vec![],
+            show_restore_report: false,
+            restore_rescan: vec![],
             pending_delete: None,
             editing_custom_path: None,
             draft_custom_path: String::new(),
@@ -571,6 +615,8 @@ impl CheckpointApp {
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         self.rx = Some(rx);
         self.restoring = true;
+        self.restore_results.clear();
+        self.restore_rescan = targets.iter().map(|(n, _)| n.clone()).collect();
 
         let ctx = ctx.clone();
         let restore_dir = PathBuf::from(&self.config.restore.path);
@@ -581,21 +627,41 @@ impl CheckpointApp {
                 ctx.request_repaint();
             };
 
-            let layout = BackupLayout::new(restore_dir);
-            if !layout.base.is_dir() {
-                send(Msg::Status(trf(
-                    "restore.no_source",
-                    &[("path", &layout.base.display())],
-                )));
-                send(Msg::RestoreFinished);
-                return;
-            }
+            // Failsafe: the whole restore pass is catch_unwind-wrapped
+            // so even an engine-level panic still sends RestoreFinished
+            // and releases the UI's blocking spinner.
+            let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let layout = BackupLayout::new(restore_dir);
+                if !layout.base.is_dir() {
+                    send(Msg::Status(trf(
+                        "restore.no_source",
+                        &[("path", &layout.base.display())],
+                    )));
+                    return;
+                }
 
-            for (name, version) in &targets {
-                send(Msg::Status(trf("restore.progress", &[("name", name)])));
-                send(Msg::RestoreDone(
-                    layout.restore_game_version(name, version.as_deref()),
-                ));
+                for (name, version) in &targets {
+                    send(Msg::Status(trf("restore.progress", &[("name", name)])));
+                    // A panic during a file overwrite must never crash
+                    // the app — surface it as a failed restore instead.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        layout.restore_game_version(name, version.as_deref())
+                    }));
+                    send(Msg::RestoreDone(match result {
+                        Ok(report) => report,
+                        Err(_) => backup::RestoreReport {
+                            game_name: name.clone(),
+                            backup_name: None,
+                            files_restored: 0,
+                            bytes_restored: 0,
+                            skipped_reason: None,
+                            errors: vec!["restore engine panicked".to_string()],
+                        },
+                    }));
+                }
+            }));
+            if work.is_err() {
+                send(Msg::Status(tr("scan.worker_died")));
             }
             send(Msg::RestoreFinished);
         });
@@ -701,9 +767,12 @@ impl CheckpointApp {
         });
     }
 
-    fn poll_messages(&mut self) {
+    fn poll_messages(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.rx else { return };
         let mut done = false;
+        // Games that wrote backups — rescan just these once the worker
+        // finishes (status colors + timestamps refresh immediately).
+        let mut post_backup_rescan: Vec<String> = vec![];
         loop {
             let msg = match rx.try_recv() {
                 Ok(msg) => msg,
@@ -735,6 +804,7 @@ impl CheckpointApp {
                     latest_backup,
                     restorable_at,
                     backup_files,
+                    synced,
                 } => {
                     let checked = match self.mode {
                         Mode::Backup => installed && !scan.found_files.is_empty(),
@@ -750,6 +820,7 @@ impl CheckpointApp {
                         latest_backup,
                         restorable_at,
                         backup_files,
+                        synced,
                     };
                     if let Some(existing) = self.games.iter_mut().find(|g| g.name == name) {
                         *existing = row;
@@ -824,6 +895,12 @@ impl CheckpointApp {
                 Msg::BackupFinished => {
                     self.backing_up = false;
                     self.show_backup_summary = !self.backup_results.is_empty();
+                    post_backup_rescan = self
+                        .backup_results
+                        .iter()
+                        .filter(|r| r.backup_name.is_some())
+                        .map(|r| r.game_name.clone())
+                        .collect();
                     done = true;
                 }
                 Msg::RestoreDone(report) => {
@@ -852,9 +929,20 @@ impl CheckpointApp {
                         ),
                         (None, None) => trf("restore.failed", &[("name", &report.game_name)]),
                     };
+                    // A clean restore means local == that snapshot by
+                    // definition — flag it now; the post-report rescan
+                    // re-verifies with real hashes.
+                    if let Some(row) =
+                        self.games.iter_mut().find(|g| g.name == report.game_name)
+                    {
+                        row.synced =
+                            report.backup_name.is_some() && report.errors.is_empty();
+                    }
+                    self.restore_results.push(report);
                 }
                 Msg::RestoreFinished => {
                     self.restoring = false;
+                    self.show_restore_report = !self.restore_results.is_empty();
                     done = true;
                 }
                 Msg::ManifestUpdateDone {
@@ -887,6 +975,12 @@ impl CheckpointApp {
         }
         if done {
             self.rx = None;
+        }
+        // Deferred until the channel borrow above has ended — the
+        // rescan gets its own channel + worker, exactly like the
+        // post-restore refresh.
+        if !post_backup_rescan.is_empty() {
+            self.start_rescan(ctx, post_backup_rescan);
         }
     }
 
@@ -1455,19 +1549,12 @@ impl CheckpointApp {
                             .scan
                             .as_ref()
                             .and_then(|s| s.found_files.values().filter_map(|f| f.mtime).max());
-                        // Red = restoring will overwrite existing local
-                        // save data; green = nothing to lose.
-                        let (local_text, local_color) = match local_mtime {
-                            Some(t) => (
-                                trf(
-                                    "restore.local_ts",
-                                    &[("ts", &fmt_dt(chrono::DateTime::<chrono::Utc>::from(t)))],
-                                ),
-                                C_RED,
-                            ),
-                            None => (tr("restore.no_local"), C_GREEN),
-                        };
-                        let name_text = if local_mtime.is_some() {
+                        // Green "in sync" when local files hash-match
+                        // the backup — restored files keep the old mtime,
+                        // so the raw date would falsely imply staleness.
+                        let (local_text, local_color) =
+                            restore_local_label(local_mtime, g.synced);
+                        let name_text = if local_mtime.is_some() && !g.synced {
                             RichText::new(i18n::display(&g.name)).strong().color(C_RED)
                         } else {
                             RichText::new(i18n::display(&g.name)).strong()
@@ -1616,6 +1703,185 @@ impl CheckpointApp {
         } else if cancel {
             self.pending_restore.clear();
         }
+    }
+
+    /// Blocking "Restoring…" overlay while the restore worker runs —
+    /// no buttons, no dismiss, so the process can't be interrupted.
+    fn restore_progress_window(&mut self, ctx: &egui::Context) {
+        if !self.restoring {
+            return;
+        }
+        egui::Modal::new(egui::Id::unique("restore_progress_modal")).show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            ui.vertical_centered(|ui| {
+                ui.add_space(10.0);
+                ui.add(egui::Spinner::new().size(30.0));
+                ui.add_space(6.0);
+                ui.label(RichText::new(tr("busy.restoring")).size(15.0).strong());
+                ui.label(
+                    RichText::new(&self.status_line)
+                        .size(11.0)
+                        .color(colors().text_weak),
+                );
+                ui.add_space(10.0);
+            });
+        });
+    }
+
+    /// "Restore Report" modal — opens when the restore worker finishes.
+    /// ✅ for clean restores, ❌ + the failure reason otherwise; the
+    /// Close button dismisses it and kicks off a targeted rescan of
+    /// just the restored games.
+    fn restore_report_window(&mut self, ctx: &egui::Context) {
+        if !self.show_restore_report {
+            return;
+        }
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique("restore_report_modal")).show(ctx, |ui| {
+            ui.set_min_width(520.0);
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+
+            ui.label(RichText::new(tr("restore.report_title")).size(17.0).strong());
+            let ok = self
+                .restore_results
+                .iter()
+                .filter(|r| r.backup_name.is_some() && r.errors.is_empty())
+                .count();
+            let failed = self.restore_results.len() - ok;
+            rtl_label(
+                ui,
+                RichText::new(trf("restore.report_summary", &[("ok", &ok), ("failed", &failed)]))
+                    .size(11.5)
+                    .color(colors().text_weak),
+            );
+            ui.add_space(4.0);
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for report in &self.restore_results {
+                        // ✅ clean restore; ❌ skipped/failed/partial —
+                        // the specific reason rides along.
+                        let (icon, icon_color, detail) = if report.backup_name.is_some()
+                            && report.errors.is_empty()
+                        {
+                            (
+                                "✅",
+                                C_GREEN,
+                                trf(
+                                    "restore.report_files",
+                                    &[
+                                        ("files", &report.files_restored),
+                                        ("size", &human_bytes(report.bytes_restored)),
+                                        ("backup", &report.backup_name.as_deref().unwrap_or_default()),
+                                    ],
+                                ),
+                            )
+                        } else {
+                            let reason = if let Some(reason) = &report.skipped_reason {
+                                translate_reason(reason)
+                            } else if let Some(first) = report.errors.first() {
+                                let mut text = first.clone();
+                                if report.errors.len() > 1 {
+                                    text.push_str(&trf(
+                                        "restore.report_more",
+                                        &[("count", &(report.errors.len() - 1))],
+                                    ));
+                                }
+                                text
+                            } else {
+                                tr("restore.failed_no_reason")
+                            };
+                            ("❌", C_RED, reason)
+                        };
+
+                        Frame::new()
+                            .fill(colors().card_bg)
+                            .stroke(Stroke::new(1.0, colors().border))
+                            .corner_radius(6)
+                            .inner_margin(Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(icon).size(16.0).color(icon_color));
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(i18n::display(&report.game_name))
+                                                .strong()
+                                                .size(12.5),
+                                        );
+                                        rtl_label(
+                                            ui,
+                                            RichText::new(detail)
+                                                .size(11.0)
+                                                .color(colors().text_weak),
+                                        );
+                                    });
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+                });
+
+            ui.add_space(4.0);
+            ui.separator();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(tr("common.close")).strong())
+                            .fill(colors().accent)
+                            .min_size(Vec2::new(120.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.show_restore_report = false;
+            self.restore_results.clear();
+            // Targeted fast scan of just the restored games — updates
+            // local save mtimes and status colors without a full scan.
+            let names = std::mem::take(&mut self.restore_rescan);
+            self.start_rescan(ctx, names);
+        }
+    }
+
+    /// Rescan only the given games on a worker thread — used after a
+    /// restore finishes so rows reflect the restored files immediately
+    /// without paying for a full manifest-wide scan.
+    fn start_rescan(&mut self, ctx: &egui::Context, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        self.rx = Some(rx);
+        self.scanning = true;
+
+        let ctx = ctx.clone();
+        let cache_dir = self.cache_dir.clone();
+        let backup_dir = self.backup_dir.clone();
+        let restore_dir = PathBuf::from(&self.config.restore.path);
+        let custom_games = self.config.custom_games.clone();
+
+        std::thread::spawn(move || {
+            let send = |msg: Msg| {
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_rescan(names, cache_dir, backup_dir, restore_dir, custom_games, &send);
+            }));
+            if result.is_err() {
+                send(Msg::ScanFinished {
+                    games: 0,
+                    error: Some("scan worker panicked".to_string()),
+                });
+            }
+        });
     }
 
     // ---------- local-save deletion ----------
@@ -2738,6 +3004,143 @@ fn run_scan(
     });
 }
 
+/// Targeted rescan of just the named games — the post-restore refresh.
+/// Same pipeline as `run_scan` (roots, steam installs, backups,
+/// custom paths) but restricted to the restored set, so it's fast.
+fn run_rescan(
+    names: Vec<String>,
+    cache_dir: PathBuf,
+    backup_dir: PathBuf,
+    restore_dir: PathBuf,
+    custom_games: Vec<config::CustomGame>,
+    send: impl Fn(Msg),
+) {
+    let manifest = {
+        let mut status = |text: String| send(Msg::Status(text));
+        match Manifest::load(&cache_dir, &mut status) {
+            Ok(m) => m,
+            Err(e) => {
+                send(Msg::ScanFinished {
+                    games: 0,
+                    error: Some(e),
+                });
+                return;
+            }
+        }
+    };
+    if manifest.0.is_empty() {
+        send(Msg::ScanFinished {
+            games: 0,
+            error: Some(tr("scan.empty_manifest")),
+        });
+        return;
+    }
+
+    let all_roots = roots::detect_roots();
+    let steam_roots: Vec<&roots::Root> = all_roots
+        .iter()
+        .filter(|r| r.store == manifest::Store::Steam)
+        .collect();
+    let steam_games = roots::steam_games(&steam_roots);
+
+    let steam_index = manifest.steam_index();
+    let mut installed_names: HashSet<String> = HashSet::new();
+    for sg in &steam_games {
+        let manifest_name = steam_index
+            .get(&sg.app_id)
+            .cloned()
+            .or_else(|| manifest.0.contains_key(&sg.name).then(|| sg.name.clone()));
+        if let Some(name) = manifest_name {
+            installed_names.insert(manifest.resolve_alias(&name));
+        }
+    }
+
+    let layout = BackupLayout::new(backup_dir);
+    let restore_layout = BackupLayout::new(restore_dir);
+    let targets: HashSet<String> = names.iter().cloned().collect();
+
+    // Backup/restore timestamps for the target names only.
+    let mut backup_games: BTreeMap<String, chrono::DateTime<chrono::Utc>> = BTreeMap::new();
+    for (name, when) in layout.restorable_games() {
+        let alias = manifest.resolve_alias(&name);
+        if targets.contains(&alias) {
+            backup_games.insert(alias, when);
+        }
+    }
+    let mut restore_games: BTreeMap<String, chrono::DateTime<chrono::Utc>> = BTreeMap::new();
+    for (name, when) in restore_layout.restorable_games() {
+        let alias = manifest.resolve_alias(&name);
+        if targets.contains(&alias) {
+            restore_games.insert(alias, when);
+        }
+    }
+    for (name, when) in &restore_games {
+        backup_games.entry(name.clone()).or_insert(*when);
+    }
+
+    let custom_index: BTreeMap<&str, &config::CustomGame> = custom_games
+        .iter()
+        .filter(|g| g.is_active())
+        .map(|g| (g.name.as_str(), g))
+        .collect();
+
+    let mut rescanned = 0usize;
+    for name in &names {
+        let custom = custom_index.get(name.as_str()).copied();
+        let manifest_game = manifest.0.get(name.as_str());
+        // Same custom-path semantics as run_scan: `override` replaces
+        // the manifest paths, `extend` merges into them; a custom-only
+        // game (no manifest entry) scans its own paths.
+        let custom_game_storage;
+        let effective: Option<&Game> = match (manifest_game, custom) {
+            (None, None) => None,
+            (Some(g), None) => Some(g),
+            (mg, Some(c)) => {
+                let entries: BTreeMap<String, manifest::GameFileEntry> = c
+                    .files
+                    .iter()
+                    .map(|p| (p.clone(), manifest::GameFileEntry::default()))
+                    .collect();
+                custom_game_storage = if c.extends() {
+                    let mut g = mg.cloned().unwrap_or_default();
+                    g.files.extend(entries);
+                    g
+                } else {
+                    Game {
+                        files: entries,
+                        ..Default::default()
+                    }
+                };
+                Some(&custom_game_storage)
+            }
+        };
+        let Some(effective) = effective else {
+            continue;
+        };
+        if effective.files.is_empty() {
+            continue;
+        }
+        rescanned += 1;
+        scan_and_emit(
+            name,
+            effective,
+            &all_roots,
+            &steam_games,
+            &installed_names,
+            &backup_games,
+            &restore_games,
+            &layout,
+            &restore_layout,
+            &send,
+        );
+    }
+
+    send(Msg::ScanFinished {
+        games: rescanned,
+        error: None,
+    });
+}
+
 /// Scan one game and emit a `GameScanned` row if it produced findings
 /// (files, an existing backup, or a detected install).
 #[allow(clippy::too_many_arguments)]
@@ -2787,6 +3190,14 @@ fn scan_and_emit(
         vec![]
     };
 
+    // Content-identical to the snapshot a restore would use? Compare
+    // hashes, not mtimes — restored files keep their original dates.
+    // Prefer the restore source's snapshot (what the modal lists),
+    // falling back to the backup dir's.
+    let synced = has_files
+        && (restore_layout.is_synced(name, &scan.found_files)
+            || layout.is_synced(name, &scan.found_files));
+
     let path_hint = steam_games
         .iter()
         .find(|sg| game.steam_ids(None).contains(&sg.app_id))
@@ -2808,6 +3219,7 @@ fn scan_and_emit(
         latest_backup,
         restorable_at,
         backup_files,
+        synced,
     });
 }
 
@@ -2830,16 +3242,18 @@ fn debug_scan() {
             latest_backup,
             restorable_at,
             backup_files,
+            synced,
         } => {
             println!(
-                "[row] {} | installed={} | files={} | size={} | backup={:?} | restorable={:?} | backup_files={}",
+                "[row] {} | installed={} | files={} | size={} | backup={:?} | restorable={:?} | backup_files={} | synced={}",
                 name,
                 installed,
                 scan.found_files.len(),
                 human_bytes(scan.total_size()),
                 latest_backup.map(|w| w.format("%Y-%m-%d").to_string()),
                 restorable_at.map(|w| w.format("%Y-%m-%d").to_string()),
-                backup_files.len()
+                backup_files.len(),
+                synced
             );
             if !path_hint.is_empty() {
                 println!("      hint: {path_hint}");
@@ -2882,6 +3296,33 @@ fn fmt_dt(dt: chrono::DateTime<chrono::Utc>) -> String {
 
 /// `backup.rs` produces English skip-reason strings; map them to locale
 /// keys. Unknown reasons pass through verbatim.
+/// The "local save" line in the Confirm Restore modal. File copies
+/// preserve the source mtime, so a restored file's date reads as the
+/// day it was originally saved, not when the backup ran — showing that
+/// date in red after a successful restore falsely suggests the data is
+/// at risk. When `synced` (hashes verified against the snapshot), show
+/// a green "Matches Backup" instead; otherwise the date stays the
+/// overwrite-risk signal it was designed to be.
+fn restore_local_label(
+    local_mtime: Option<std::time::SystemTime>,
+    synced: bool,
+) -> (String, egui::Color32) {
+    if synced {
+        (tr("restore.synced"), C_GREEN)
+    } else {
+        match local_mtime {
+            Some(t) => (
+                trf(
+                    "restore.local_ts",
+                    &[("ts", &fmt_dt(chrono::DateTime::<chrono::Utc>::from(t)))],
+                ),
+                C_RED,
+            ),
+            None => (tr("restore.no_local"), C_GREEN),
+        }
+    }
+}
+
 fn translate_reason(reason: &str) -> String {
     let key = match reason {
         "no save files found" => "reason.no_save_files",
@@ -2889,6 +3330,7 @@ fn translate_reason(reason: &str) -> String {
         "no files could be copied" => "reason.no_files_copied",
         "no backup found" => "reason.no_backup",
         "backup has no snapshots" => "reason.no_snapshots",
+        "restore engine panicked" => "reason.panicked",
         _ => return reason.to_string(),
     };
     tr(key)
@@ -3169,6 +3611,7 @@ mod tests {
             latest_backup,
             restorable_at: None,
             backup_files: backup_paths.iter().map(|p| (p.to_string(), 4u64)).collect(),
+            synced: false,
         }
     }
 
@@ -3208,6 +3651,96 @@ mod tests {
         // Games that actually have save files are unaffected.
         let g = row(true, &["C:/saves/a.sav", "C:/saves/b.dat"], &[], None);
         assert!(matches!(g.status(false), Status::NoBackup));
+    }
+
+    /// The Ace Combat 7 scenario: a restore writes files that KEEP the
+    /// original save's mtime (copies preserve timestamps), so the local
+    /// "date" reads older than the backup it came from. Once the scan
+    /// verifies the content hashes match, the confirm modal must show a
+    /// green "Matches Backup" — not a misleading red stale date.
+    #[test]
+    fn restore_local_label_shows_synced_state_not_old_mtime() {
+        // i18n's global language is process-wide — hold its test lock
+        // so a parallel i18n test can't flip to ar-SA mid-assertion.
+        let _lock = crate::i18n::tests::LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        i18n::init("en-US");
+        // A file "modified" long before the backup ran — exactly what a
+        // restored file looks like.
+        let old_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_712_000_000);
+
+        // Synced -> green "Matches Backup", date never rendered.
+        let (text, color) = restore_local_label(Some(old_mtime), true);
+        assert_eq!(text, tr("restore.synced"));
+        assert_eq!(color, C_GREEN);
+
+        // Same old mtime but NOT synced -> the red overwrite-risk date.
+        // (Compare against the localized template itself — `tr` returns
+        // the key when i18n isn't initialized in test context.)
+        let expected =
+            trf("restore.local_ts", &[("ts", &fmt_dt(chrono::DateTime::<chrono::Utc>::from(old_mtime)))]);
+        let (text, color) = restore_local_label(Some(old_mtime), false);
+        assert_eq!(text, expected);
+        assert_ne!(text, tr("restore.synced"));
+        assert_eq!(color, C_RED);
+
+        // No local files at all -> the harmless "no local data" note.
+        let (text, color) = restore_local_label(None, false);
+        assert_eq!(text, tr("restore.no_local"));
+        assert_eq!(color, C_GREEN);
+        // Nothing local but flagged synced (defensive) still wins green.
+        let (_, color) = restore_local_label(None, true);
+        assert_eq!(color, C_GREEN);
+    }
+
+    /// Strict staleness: a green "recent backup" must also be CURRENT.
+    /// Any local file newer than the newest snapshot — or any file
+    /// whose hash the snapshot doesn't record — downgrades the row to
+    /// yellow so a (differential) backup gets prompted. `synced` stays
+    /// green because hash-verified identical content is never stale.
+    #[test]
+    fn needs_backup_when_local_files_newer_than_backup() {
+        use std::time::{Duration, SystemTime};
+        let backup_when = chrono::Utc::now() - chrono::Duration::hours(2);
+        let old_t = SystemTime::now() - Duration::from_secs(86400);
+        let new_t = SystemTime::now();
+        let set_file = |g: &mut GameRow, change: ScanChange, mtime: Option<SystemTime>| {
+            g.scan.as_mut().unwrap().found_files.values_mut().for_each(|f| {
+                f.change = change;
+                f.mtime = mtime;
+            });
+        };
+
+        // Everything Same + older mtimes -> recent green.
+        let mut g = row(true, &["C:/s/a.sav"], &[], Some(backup_when));
+        set_file(&mut g, ScanChange::Same, Some(old_t));
+        assert!(matches!(g.status(false), Status::RecentBackup));
+
+        // One file written AFTER the backup -> yellow even though the
+        // backup itself is recent.
+        set_file(&mut g, ScanChange::Same, Some(new_t));
+        assert!(matches!(g.status(false), Status::OldBackup));
+
+        // Hash-verified synced content overrides the misleading mtime.
+        g.synced = true;
+        assert!(matches!(g.status(false), Status::RecentBackup));
+        g.synced = false;
+
+        // Content changed but timestamp is old (e.g. copied in) ->
+        // the hash still catches it: yellow.
+        set_file(&mut g, ScanChange::Different, Some(old_t));
+        assert!(matches!(g.status(false), Status::OldBackup));
+
+        // A brand-new file the snapshot doesn't know -> yellow.
+        set_file(&mut g, ScanChange::New, Some(old_t));
+        assert!(matches!(g.status(false), Status::OldBackup));
+
+        // No local files at all -> nothing can be stale; recency rules.
+        let g = row(true, &[], &[], Some(backup_when));
+        // (config-only heuristic fires on installed+empty scan, so the
+        // bypass via `verified` is what exposes the color here)
+        assert!(matches!(g.status(true), Status::RecentBackup));
     }
 
     /// End-to-end font verification: run the ACTUAL display string for
@@ -3434,7 +3967,7 @@ impl eframe::App for CheckpointApp {
             apply_theme(ui.ctx(), self.config.theme);
             self.theme_applied = self.config.theme;
         }
-        self.poll_messages();
+        self.poll_messages(ui.ctx());
         self.poll_images(ui.ctx());
         if self.busy() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
@@ -3447,6 +3980,8 @@ impl eframe::App for CheckpointApp {
         self.settings_window(ui.ctx());
         self.backup_summary_window(ui.ctx());
         self.restore_confirm_window(ui.ctx());
+        self.restore_progress_window(ui.ctx());
+        self.restore_report_window(ui.ctx());
         self.delete_confirm_window(ui.ctx());
         self.custom_path_window(ui.ctx());
     }
