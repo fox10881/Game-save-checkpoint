@@ -1,6 +1,6 @@
 <img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/35633c3f-b87b-4c75-b96a-e746d186d806" />
+<img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/42d3c9a6-8739-4684-ac26-c6534b7c0530" />
 
-<img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/a11e4655-35c2-4295-83cc-27fd7907734f" />
 
 # Game save CHECKPOINT
 
