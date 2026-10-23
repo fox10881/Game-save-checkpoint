@@ -1,5 +1,5 @@
-<img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/35633c3f-b87b-4c75-b96a-e746d186d806" />
-<img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/42d3c9a6-8739-4684-ac26-c6534b7c0530" />
+<img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/d2102940-51a9-4f35-952e-1c52a75747d9" />
+<img width="3840" height="2160" alt="image" src="https://github.com/user-attachments/assets/7f4f02cb-99ce-49ee-b5e1-a5d42e5968bb" />
 
 
 # Game save CHECKPOINT
