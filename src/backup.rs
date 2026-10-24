@@ -109,8 +109,66 @@ impl IndividualMapping {
         key
     }
 
+    /// The last FULL backup. For "newest snapshot" semantics
+    /// (differentials included) use `newest_snapshot`.
     pub fn latest_backup(&self) -> Option<&FullBackup> {
         self.backups.back()
+    }
+
+    /// The newest snapshot overall — the last differential child of the
+    /// last full backup, or that full itself. Returns its folder name
+    /// (`backup-<ts>`) and timestamp. `latest_backup()` alone misses
+    /// differentials, which leaves restore/state checks stale whenever
+    /// the newest snapshot is a diff.
+    pub fn newest_snapshot(&self) -> Option<(&str, chrono::DateTime<chrono::Utc>)> {
+        let last = self.backups.back()?;
+        Some(
+            last.children
+                .back()
+                .map(|c| (c.name.as_str(), c.when))
+                .unwrap_or((last.name.as_str(), last.when)),
+        )
+    }
+
+    /// Effective file set of snapshot `target`: the full backup's files
+    /// with every intervening differential replayed — `Some` entries
+    /// overlay, `None` tombstones delete. `None` when `target` is
+    /// unknown. Same merge logic `restore_plan` uses, minus the
+    /// per-file source-folder tracking restore needs.
+    pub fn effective_files(
+        &self,
+        target: &str,
+    ) -> Option<BTreeMap<String, IndividualMappingFile>> {
+        for full in &self.backups {
+            if full.name == target {
+                return Some(full.files.clone());
+            }
+            let mut effective = full.files.clone();
+            for child in &full.children {
+                for (k, v) in &child.files {
+                    match v {
+                        Some(f) => {
+                            effective.insert(k.clone(), f.clone());
+                        }
+                        None => {
+                            effective.remove(k);
+                        }
+                    }
+                }
+                if child.name == target {
+                    return Some(effective);
+                }
+            }
+        }
+        None
+    }
+
+    /// Effective file set of the newest snapshot — what a default
+    /// restore would write and what change detection should compare
+    /// against.
+    pub fn newest_effective_files(&self) -> Option<BTreeMap<String, IndividualMappingFile>> {
+        let name = self.newest_snapshot()?.0;
+        self.effective_files(name)
     }
 
     pub fn load(path: &Path) -> Option<Self> {
@@ -186,10 +244,11 @@ impl BackupLayout {
         IndividualMapping::load(&Self::mapping_file(&self.game_folder(game_name)))
     }
 
-    /// Latest backup timestamp for a game, if any.
+    /// Latest snapshot timestamp for a game — differentials included.
     #[allow(dead_code)]
     pub fn latest_backup_time(&self, game_name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.load_mapping(game_name).and_then(|m| m.latest_backup().map(|b| b.when))
+        self.load_mapping(game_name)
+            .and_then(|m| m.newest_snapshot().map(|(_, when)| when))
     }
 
     /// Every snapshot for a game, newest first: the full backups in
@@ -234,9 +293,9 @@ impl BackupLayout {
             }
             let mapping_file = Self::mapping_file(&entry.path());
             if let Some(mapping) = IndividualMapping::load(&mapping_file)
-                && let Some(latest) = mapping.latest_backup()
+                && let Some((_, when)) = mapping.newest_snapshot()
             {
-                games.push((mapping.name.clone(), latest.when));
+                games.push((mapping.name.clone(), when));
             }
         }
         games
@@ -329,29 +388,82 @@ impl BackupLayout {
         report
     }
 
-    /// Enforce the retention limit for one game: keep the newest `full`
-    /// backups and delete the rest, both from `mapping.yaml` and disk.
-    /// Mirrors Ludusavi's `GameLayout::back_up` retention pruning.
-    pub fn enforce_retention(&self, game_name: &str, full: u8) -> usize {
+    /// "Total backups to keep": keep at most `total` snapshots counting
+    /// FULLS AND DIFFERENTIALS together, deleting from the oldest end
+    /// while never orphaning a differential. Works backwards from the
+    /// newest snapshot — keeping a diff also keeps its parent full and
+    /// every earlier sibling it depends on, so every kept point is
+    /// always restorable. When a diff's whole ancestor chain doesn't
+    /// fit the budget, that diff is dropped but older points still can
+    /// be kept, so the result is as close to `total` as chains allow.
+    /// Returns how many snapshots were removed.
+    pub fn enforce_total_retention(&self, game_name: &str, total: u8) -> usize {
         let game_folder = self.game_folder(game_name);
         let Some(mut mapping) = self.load_mapping(game_name) else {
             return 0;
         };
-        let keep = full.max(1) as usize;
-        if mapping.backups.len() <= keep {
+        let budget = total.max(1) as usize;
+
+        // Flatten to (full idx, child idx or None, name, when) — the
+        // indices are the pruning unit's identity in the mapping.
+        let mut points: Vec<(usize, Option<usize>, String, chrono::DateTime<chrono::Utc>)> =
+            Vec::new();
+        for (fi, full) in mapping.backups.iter().enumerate() {
+            points.push((fi, None, full.name.clone(), full.when));
+            for (ci, child) in full.children.iter().enumerate() {
+                points.push((fi, Some(ci), child.name.clone(), child.when));
+            }
+        }
+        if points.len() <= budget {
             return 0;
         }
+        points.sort_by(|a, b| a.3.cmp(&b.3));
 
-        let mut removed = 0;
-        while mapping.backups.len() > keep {
-            let Some(old) = mapping.backups.pop_front() else {
-                break;
-            };
-            let dir = game_folder.join(&old.name);
-            if dir.exists() {
-                let _ = std::fs::remove_dir_all(&dir);
+        // Newest → oldest: keep a point when it plus its unkept
+        // ancestors still fit. An unkept point can't be depended on by
+        // anything already kept (dependents are newer, processed first,
+        // and would have pulled it in) — so skipping is always safe.
+        let mut keep: std::collections::HashSet<(usize, Option<usize>)> =
+            std::collections::HashSet::new();
+        for &(fi, ci, _, _) in points.iter().rev() {
+            let mut required = vec![(fi, ci)];
+            if let Some(c) = ci {
+                required.push((fi, None));
+                required.extend((0..c).map(|a| (fi, Some(a))));
             }
-            removed += 1;
+            let need = required.iter().filter(|r| !keep.contains(*r)).count();
+            if keep.len() + need <= budget {
+                keep.extend(required);
+            }
+        }
+
+        // Delete every unkept point's snapshot folder from disk —
+        // dropping a full removes its whole chain with it.
+        let mut removed = 0usize;
+        for (fi, ci, name, _) in &points {
+            if !keep.contains(&(*fi, *ci)) {
+                let dir = game_folder.join(name);
+                if dir.exists() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                removed += 1;
+            }
+        }
+
+        // Rewrite the mapping: kept fulls keep only kept children;
+        // unkept fulls (and their whole child chains) are gone.
+        let backups: Vec<FullBackup> = std::mem::take(&mut mapping.backups).into();
+        for (fi, mut full) in backups.into_iter().enumerate() {
+            if keep.contains(&(fi, None)) {
+                full.children = full
+                    .children
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(ci, _)| keep.contains(&(fi, Some(*ci))))
+                    .map(|(_, c)| c)
+                    .collect();
+                mapping.backups.push_back(full);
+            }
         }
         let _ = mapping.save(&Self::mapping_file(&game_folder));
         removed
@@ -789,6 +901,159 @@ backups:
         assert!(!layout.is_synced("SyncGame", &scan(&[])));
         // No backup at all → false.
         assert!(!layout.is_synced("NoGame", &scan(&[("C:/a", "h", 1)])));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `newest_snapshot`/`newest_effective_files` must see DIFFERENTIAL
+    /// children, not just the last full — otherwise restorable dates go
+    /// stale and diff-covered files read as perpetually "changed".
+    #[test]
+    fn newest_snapshot_includes_differentials() {
+        let base = std::env::temp_dir().join("gsc-tests").join("newest");
+        let _ = std::fs::remove_dir_all(&base);
+        let game_dir = base.join("DiffGame");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        std::fs::write(
+            game_dir.join("mapping.yaml"),
+            r#"---
+name: DiffGame
+drives: {}
+backups:
+  - name: backup-20240101T000000Z
+    when: 2024-01-01T00:00:00Z
+    files:
+      "C:/Saves/a.sav": { hash: h1, size: 100 }
+      "C:/Saves/b.sav": { hash: h2, size: 200 }
+    children:
+      - name: backup-20240102T000000Z
+        when: 2024-01-02T00:00:00Z
+        files:
+          "C:/Saves/a.sav": { hash: h3, size: 150 }
+          "C:/Saves/c.sav": { hash: h9, size: 50 }
+          "C:/Saves/b.sav": ~
+"#,
+        )
+        .unwrap();
+
+        let layout = BackupLayout::new(base.clone());
+        // restorable_games reports the DIFF's timestamp, not the full's.
+        let games = layout.restorable_games();
+        assert_eq!(games.len(), 1);
+        assert_eq!(
+            games[0].1.to_rfc3339(),
+            "2024-01-02T00:00:00+00:00",
+            "restorable date must be the newest DIFF, not its parent full"
+        );
+
+        let mapping = layout.load_mapping("DiffGame").unwrap();
+        let (name, when) = mapping.newest_snapshot().unwrap();
+        assert_eq!(name, "backup-20240102T000000Z");
+        assert_eq!(when.to_rfc3339(), "2024-01-02T00:00:00+00:00");
+
+        // Effective files = full replayed through the diff: a@h3, c@h9,
+        // b tombstoned out.
+        let files = mapping.newest_effective_files().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files["C:/Saves/a.sav"].hash, "h3");
+        assert_eq!(files["C:/Saves/c.sav"].hash, "h9");
+        assert!(!files.contains_key("C:/Saves/b.sav"));
+
+        // An explicit older target resolves to its own state.
+        let files = mapping.effective_files("backup-20240101T000000Z").unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files["C:/Saves/a.sav"].hash, "h1");
+        assert!(files.contains_key("C:/Saves/b.sav"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Total-retention pruning: exactly N restorable points, newest
+    /// first, never orphaning a differential — keeping a diff pulls in
+    /// its parent full and earlier siblings.
+    #[test]
+    fn enforce_total_retention_counts_all_snapshots_preserves_chains() {
+        let base = std::env::temp_dir().join("gsc-tests").join("retention");
+        let _ = std::fs::remove_dir_all(&base);
+        let game_dir = base.join("RetGame");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        // 6 points: F1 + d1 + d2 + d3 | F2 | F3
+        std::fs::write(
+            game_dir.join("mapping.yaml"),
+            r#"---
+name: RetGame
+drives: {}
+backups:
+  - name: backup-20240101T000000Z
+    when: 2024-01-01T00:00:00Z
+    files: { "C:/a": { hash: h, size: 1 } }
+    children:
+      - name: backup-20240102T000000Z
+        when: 2024-01-02T00:00:00Z
+        files: { "C:/a": { hash: h, size: 1 } }
+      - name: backup-20240103T000000Z
+        when: 2024-01-03T00:00:00Z
+        files: { "C:/a": { hash: h, size: 1 } }
+      - name: backup-20240104T000000Z
+        when: 2024-01-04T00:00:00Z
+        files: { "C:/a": { hash: h, size: 1 } }
+  - name: backup-20240105T000000Z
+    when: 2024-01-05T00:00:00Z
+    files: { "C:/a": { hash: h, size: 1 } }
+  - name: backup-20240106T000000Z
+    when: 2024-01-06T00:00:00Z
+    files: { "C:/a": { hash: h, size: 1 } }
+"#,
+        )
+        .unwrap();
+        // On-disk snapshot folders that pruning must remove too.
+        for d in [
+            "backup-20240101T000000Z", "backup-20240102T000000Z",
+            "backup-20240103T000000Z", "backup-20240104T000000Z",
+            "backup-20240105T000000Z", "backup-20240106T000000Z",
+        ] {
+            std::fs::create_dir_all(game_dir.join(d)).unwrap();
+        }
+        let layout = BackupLayout::new(base.clone());
+
+        // N=4: F3+F2 kept; d3/d2's ancestors (F1+d1+d2) cost too much
+        // so they drop; d1 fits with F1 — exactly 4 restorable points.
+        assert_eq!(layout.enforce_total_retention("RetGame", 4), 2);
+        let kept = layout.load_mapping("RetGame").unwrap();
+        let kept_names: Vec<String> = kept
+            .backups
+            .iter()
+            .flat_map(|f| {
+                std::iter::once(f.name.clone())
+                    .chain(f.children.iter().map(|c| c.name.clone()))
+            })
+            .collect();
+        assert_eq!(
+            kept_names,
+            vec![
+                "backup-20240101T000000Z", // full — needed by d1
+                "backup-20240102T000000Z", // d1 — kept, chain intact
+                "backup-20240105T000000Z", // F2
+                "backup-20240106T000000Z", // F3
+            ]
+        );
+        assert!(game_dir.join("backup-20240103T000000Z").is_dir() == false);
+        assert!(game_dir.join("backup-20240104T000000Z").is_dir() == false);
+        assert!(game_dir.join("backup-20240101T000000Z").is_dir());
+        assert!(game_dir.join("backup-20240102T000000Z").is_dir());
+
+        // N=1 on the remaining {F1,d1,F2,F3}: only F3 survives — a
+        // diff's whole chain can't fit, and the orphaned F1+d1 go too.
+        assert_eq!(layout.enforce_total_retention("RetGame", 1), 3);
+        let kept = layout.load_mapping("RetGame").unwrap();
+        assert_eq!(kept.backups.len(), 1);
+        assert_eq!(kept.backups[0].name, "backup-20240106T000000Z");
+        assert!(kept.backups[0].children.is_empty());
+        assert!(game_dir.join("backup-20240101T000000Z").is_dir() == false);
+        assert!(game_dir.join("backup-20240102T000000Z").is_dir() == false);
+
+        // Already within budget → no-op.
+        assert_eq!(layout.enforce_total_retention("RetGame", 1), 0);
 
         let _ = std::fs::remove_dir_all(&base);
     }

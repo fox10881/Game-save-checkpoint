@@ -310,7 +310,6 @@ struct CheckpointApp {
     draft_backup_dir: String,
     draft_restore_dir: String,
     draft_full_retention: u8,
-    draft_diff_retention: u8,
     settings_error: Option<String>,
     /// Manifest update state (shared `cache.yaml` timestamps).
     manifest_updating: bool,
@@ -430,7 +429,6 @@ impl CheckpointApp {
             draft_backup_dir: String::new(),
             draft_restore_dir: String::new(),
             draft_full_retention: 1,
-            draft_diff_retention: 0,
             settings_error: None,
             manifest_updating: false,
             manifest_checked,
@@ -536,7 +534,7 @@ impl CheckpointApp {
 
         let ctx = ctx.clone();
         let backup_dir = self.backup_dir.clone();
-        let retention_full = self.config.backup.retention.full;
+        let retention_total = self.config.backup.retention.full;
 
         std::thread::spawn(move || {
             let send = |msg: Msg| {
@@ -555,7 +553,8 @@ impl CheckpointApp {
                 send(Msg::Status(trf("backup.progress", &[("name", &scan.game_name)])));
                 let mut report = layout.back_up_game(scan);
                 if report.backup_name.is_some() {
-                    report.pruned = layout.enforce_retention(&scan.game_name, retention_full);
+                    report.pruned =
+                        layout.enforce_total_retention(&scan.game_name, retention_total);
                 }
                 send(Msg::BackupDone(report));
             }
@@ -1018,7 +1017,6 @@ impl CheckpointApp {
         self.draft_backup_dir = self.config.backup.path.clone();
         self.draft_restore_dir = self.config.restore.path.clone();
         self.draft_full_retention = self.config.backup.retention.full.max(1);
-        self.draft_diff_retention = self.config.backup.retention.differential;
         self.draft_language = if self.config.language.is_empty() {
             i18n::LANGUAGE_ENGLISH.to_string()
         } else {
@@ -1043,7 +1041,6 @@ impl CheckpointApp {
         self.config.backup.path = normalize(&self.draft_backup_dir);
         self.config.restore.path = normalize(&self.draft_restore_dir);
         self.config.backup.retention.full = self.draft_full_retention.max(1);
-        self.config.backup.retention.differential = self.draft_diff_retention;
         let language_changed = self.config.language != self.draft_language;
         self.config.language = self.draft_language.clone();
         self.config.theme = self.draft_theme;
@@ -1262,16 +1259,6 @@ impl CheckpointApp {
                     ui.add(
                         egui::DragValue::new(&mut self.draft_full_retention)
                             .range(1..=255)
-                            .speed(0.05),
-                    );
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.label(tr("settings.retention_diff"));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut self.draft_diff_retention)
-                            .range(0..=255)
                             .speed(0.05),
                     );
                 });
@@ -3156,11 +3143,14 @@ fn scan_and_emit(
     restore_layout: &BackupLayout,
     send: &dyn Fn(Msg),
 ) {
+    // Change detection compares against the NEWEST snapshot's
+    // effective file set — differentials replayed. Using only the last
+    // full would flag every diff-covered file as changed forever.
     let previous_files = backup_games
         .contains_key(name)
         .then(|| layout.load_mapping(name))
         .flatten()
-        .and_then(|m| m.latest_backup().map(|b| b.files.clone()));
+        .and_then(|m| m.newest_effective_files());
 
     let scan =
         scanner::scan_game_for_backup(name, game, all_roots, steam_games, previous_files.as_ref());
@@ -3182,8 +3172,9 @@ fn scan_and_emit(
             .load_mapping(name)
             .or_else(|| layout.load_mapping(name))
             .and_then(|m| {
-                m.latest_backup()
-                    .map(|b| b.files.iter().map(|(p, f)| (p.clone(), f.size)).collect())
+                m.newest_effective_files().map(|files| {
+                    files.iter().map(|(p, f)| (p.clone(), f.size)).collect()
+                })
             })
             .unwrap_or_default()
     } else {

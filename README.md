@@ -67,8 +67,12 @@ contents — not just "does a backup exist".
   of *just* the restored games — status colors, local mtimes and sync
   flags refresh immediately, no full library scan. Successful backups
   rescan the same way.
-- **Retention limits** — configurable Full and Differential retention,
-  pruning older snapshots per Ludusavi's rules.
+- **Smart Pruning (Total Retention)** — one setting, "Total backups to
+  keep", counts every snapshot (Full + Differential). After each backup
+  the pruner walks history newest-first and deletes the oldest points
+  until exactly N restorable versions remain — without ever orphaning a
+  differential from the Full it depends on (keeping a diff pulls in its
+  ancestors; a dropped Full removes its whole chain).
 - **Light / Dark themes** — shared `theme:` key with Ludusavi, switchable
   in Settings; the whole palette follows.
 - **Full Arabic (RTL) support** — complete English/Arabic localization via
